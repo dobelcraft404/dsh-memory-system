@@ -1,0 +1,10 @@
+[Unit]
+Description=Flush pending session consolidation
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

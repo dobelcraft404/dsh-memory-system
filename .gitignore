@@ -1,0 +1,24 @@
+# 个人记忆数据与本地运行状态：不提交
+state/*.json
+state/*.txt
+logs/*.log
+logs/*.txt
+.locks/
+
+# 记忆内容
+persona.md
+last_session.json
+short-term/*.md
+!short-term/README.md
+long-term/entries/*.md
+mid-term/entries/*.md
+archive/**/*.md
+!archive/INDEX.md
+
+# 运行时
+__pycache__/
+*.pyc
+tests/tmp-*/
+tests/.tmp-*/
+.tmp-*/
+*.log

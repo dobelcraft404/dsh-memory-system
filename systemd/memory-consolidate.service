@@ -1,0 +1,14 @@
+[Unit]
+Description=DSH memory consolidation (daily)
+Documentation=file:%h/.dsh/memory-system/MEMORY-POLICY.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.dsh/memory-system
+ExecStart=/usr/bin/env python3 %h/.dsh/memory-system/consolidate_memory.py --root %h/.dsh/memory-system --reason daily
+Environment=PYTHONUNBUFFERED=1
+Nice=10
+IOSchedulingClass=idle
+StandardOutput=append:%h/.dsh/memory-system/logs/consolidate.log
+StandardError=append:%h/.dsh/memory-system/logs/consolidate.log
+TimeoutStartSec=15min
