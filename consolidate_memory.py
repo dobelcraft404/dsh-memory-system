@@ -33,7 +33,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -76,6 +76,7 @@ MAX_TAGS = 5
 MAX_LLM_INPUT_CHARS = 12000
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 STATE_PROCESSED_LIMIT = 500
+SUGGESTIONS_RETENTION_DAYS = 7  # SUGGESTIONS.md 只保留最近 7 天的日期块
 
 LONG_TERM_INDEX_HEADER = """# 长期记忆索引
 
@@ -2227,6 +2228,54 @@ def scan_inbox(root: Path, existing_paths: set[str], dry_run: bool) -> list[Inbo
 # ---------------------------------------------------------------------------
 # SUGGESTIONS.md / state 写入
 # ---------------------------------------------------------------------------
+def parse_suggestions_stamp(text: str) -> datetime | None:
+    """解析 SUGGESTIONS.md 的 `## <ISO 时间>` 标题；失败返回 None（该块原样保留）。"""
+
+    try:
+        value = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if value.tzinfo is None:
+        value = value.astimezone()
+    return value
+
+
+def prune_suggestions(root: Path, now: datetime, dry_run: bool) -> int:
+    """删除 SUGGESTIONS.md 中早于保留期的日期块；返回删除的块数。"""
+
+    path = root / "SUGGESTIONS.md"
+    if not path.exists():
+        return 0
+    with locked_file(root, path):
+        current = read_text(path)
+        if not current.strip():
+            return 0
+        header_lines: list[str] = []
+        blocks: list[tuple[datetime | None, list[str]]] = []
+        for line in current.splitlines():
+            if line.startswith("## "):
+                blocks.append((parse_suggestions_stamp(line[3:].strip()), [line]))
+            elif blocks:
+                blocks[-1][1].append(line)
+            else:
+                header_lines.append(line)
+        cutoff = now - timedelta(days=SUGGESTIONS_RETENTION_DAYS)
+        kept = [block for stamp, block in blocks if stamp is None or stamp >= cutoff]
+        removed = len(blocks) - len(kept)
+        if not removed:
+            return 0
+        if dry_run:
+            LOGGER.info("[dry-run] 将清理 SUGGESTIONS.md 过期块 %d 个", removed)
+            return removed
+        while header_lines and not header_lines[-1].strip():
+            header_lines.pop()
+        parts = ["\n".join(header_lines) if header_lines else SUGGESTIONS_HEADER.rstrip()]
+        parts.extend("\n".join(block).strip("\n") for block in kept)
+        atomic_write_text(path, "\n\n".join(parts).rstrip() + "\n")
+        LOGGER.info("SUGGESTIONS.md 清理过期块 %d 个", removed)
+    return removed
+
+
 def append_suggestions(
     root: Path,
     pending: list[PendingSuggestion],
@@ -2420,6 +2469,7 @@ def run_consolidation(
     stats.inbox_suggestions = len(inbox_items)
 
     append_suggestions(root, pending, inbox_items, started_at, bool(args.dry_run))
+    prune_suggestions(root, started_at, bool(args.dry_run))
 
     stats.duration_seconds = round(time.perf_counter() - started_perf, 3)
     if args.dry_run:

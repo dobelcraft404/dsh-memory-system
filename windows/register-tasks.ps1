@@ -11,6 +11,7 @@
 # 特点：
 #   - 不需要管理员权限（当前用户任务）；
 #   - 不需要密码；
+#   - 任务动作经 wscript.exe + run-hidden.vbs 静默启动（无控制台窗口，不抢焦点）；
 #   - 任务动作调用 windows\run-*.ps1 / backup-memory.ps1，Python 路径自动探测；
 #   - consolidate 脚本内部 6 小时幂等，重复触发会跳过。
 #
@@ -52,6 +53,17 @@ if (-not $pwshPath -or -not (Test-Path -LiteralPath $pwshPath)) {
     $pwshPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 }
 
+# 2026-11-08：静默启动器。任务计划直接跑 powershell.exe 时，即使加了
+# -WindowStyle Hidden 也会先弹出一个控制台窗口再隐藏，全屏游戏里会闪一下并造成失焦。
+# 改为 wscript.exe + run-hidden.vbs（WshShell.Run style=0），全程没有控制台窗口。
+$hiddenLauncher = Join-Path $Root 'windows\run-hidden.vbs'
+$wscriptPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
+foreach ($silentRequired in @($hiddenLauncher, $wscriptPath)) {
+    if (-not (Test-Path -LiteralPath $silentRequired)) {
+        throw "静默启动器缺失：$silentRequired"
+    }
+}
+
 function New-Action {
     param([string]$ScriptPath, [string[]]$ScriptArgs = @())
     $argument = @(
@@ -64,9 +76,10 @@ function New-Action {
     if ($Python) {
         $argument += @('-Python', "`"$Python`"")
     }
+    $vbsArgs = @('//B', '//Nologo', "`"$hiddenLauncher`"", "`"$Root`"", "`"$pwshPath`"") + $argument
     return New-ScheduledTaskAction `
-        -Execute $pwshPath `
-        -Argument ($argument -join ' ') `
+        -Execute $wscriptPath `
+        -Argument ($vbsArgs -join ' ') `
         -WorkingDirectory $Root
 }
 
@@ -75,6 +88,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -MultipleInstances IgnoreNew `
+    -Hidden `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
 
 # ---------------------------------------------------------------------------

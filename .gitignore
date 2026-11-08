@@ -1,24 +1,28 @@
-# 个人记忆数据与本地运行状态：不提交
-state/*.json
-state/*.txt
-logs/*.log
-logs/*.txt
-.locks/
-
-# 记忆内容
+# 私有数据 —— 一律不入库
+state/
+logs/
+diary/
 persona.md
-last_session.json
+long-term/entries/
+mid-term/entries/
 short-term/*.md
 !short-term/README.md
-long-term/entries/*.md
-mid-term/entries/*.md
 archive/**/*.md
 !archive/INDEX.md
-
-# 运行时
-__pycache__/
-*.pyc
-tests/tmp-*/
-tests/.tmp-*/
+*.bak*
+*.dpapi
+.locks/
+.consolidate.lock
 .tmp-*/
-*.log
+tmp/
+
+# Python / 编辑器
+__pycache__/
+*.py[cod]
+.venv/
+.vscode/
+.idea/
+.DS_Store
+
+# 本地授权产物
+windows/grant-elevated.log

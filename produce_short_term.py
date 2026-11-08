@@ -281,7 +281,7 @@ def call_llm(config: dict[str, str], prompt: str) -> str:
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.1,
-        "max_tokens": 2400,
+        "max_tokens": 6000,
         "response_format": {"type": "json_object"},
     }
     url = config["base_url"] + "/chat/completions"
@@ -679,7 +679,7 @@ def find_sessions(sessions_root: Path) -> list[Path]:
     if not sessions_root.is_dir():
         return []
     return sorted(
-        sessions_root.glob("*/session-*/session.v4.jsonl.zstd"),
+        sessions_root.glob("*/*/session.v4.jsonl.zstd"),
         key=lambda path: path.stat().st_mtime if path.exists() else 0,
     )
 
@@ -735,8 +735,9 @@ def process(
             if not new_events:
                 continue
             if len(new_events) > MAX_BACKLOG_MESSAGES:
-                LOGGER.info("会话 %s 新增 %d 条，回看最近 %d 条", key, len(new_events), MAX_BACKLOG_MESSAGES)
-                new_events = new_events[-MAX_BACKLOG_MESSAGES:]
+                # 按时间正序推进：先处理最早的一段，下次再往后走，避免中间消息被整段跳过。
+                LOGGER.info("会话 %s 新增 %d 条，本轮处理最早 %d 条", key, len(new_events), MAX_BACKLOG_MESSAGES)
+                new_events = new_events[:MAX_BACKLOG_MESSAGES]
 
             seq_to_mark = max(event["seq"] for event in new_events)
             transcript = build_transcript(new_events, MAX_TRANSCRIPT_CHARS)

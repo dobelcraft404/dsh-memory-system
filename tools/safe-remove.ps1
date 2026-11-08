@@ -1,9 +1,9 @@
-<#
+﻿<#
 .SYNOPSIS
     安全递归删除封装：任何 Remove-Item -Recurse -Force 之前必须先过这一关。
 
 .DESCRIPTION
-    针对 2026-11-05 事故（脚本里 `$home` 赋值失败后 Remove-Item 删掉整个 C:\Users\<user>）。
+    针对 2026-11-05 事故（脚本里 `$home` 赋值失败后 Remove-Item 删掉整个用户目录）。
     校验项（任一不满足直接拒绝，退出码 2）：
       1. 路径必须是绝对路径，不得含通配符 / '..' / 环境变量残留，不得以 '\' 结尾。
       2. 目标不得是：盘符根、C:\Windows、C:\Program Files(  (x86))、C:\ProgramData、C:\Users。
