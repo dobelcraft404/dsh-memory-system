@@ -48,7 +48,7 @@ def main() -> int:
     names = [tool["name"] for tool in tools]
     print("tools:", names)
     assert names == sorted(names), "工具未按字母序"
-    assert len(names) == 6, f"工具数量异常：{len(names)}"
+    assert len(names) == 7, f"工具数量异常：{len(names)}"
 
     result = rpc(
         {

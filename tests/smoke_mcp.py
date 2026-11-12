@@ -12,7 +12,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,7 +86,10 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    temp_root = Path(tempfile.mkdtemp(prefix="dsh-memory-smoke-"))
+    # 用仓库内 .tmp：某些环境（%TEMP% 不可写、杀软/沙箱）下 tempfile 会失败。
+    temp_root = ROOT / ".tmp" / f"smoke-{os.getpid()}"
+    shutil.rmtree(temp_root, ignore_errors=True)
+    temp_root.mkdir(parents=True, exist_ok=True)
     client = McpClient(temp_root)
     try:
         init = client.request(
@@ -112,8 +114,9 @@ def main() -> int:
                 "get_memory_index",
                 "read_emotion_state",
                 "read_memory_entry",
+                "session_search",
             },
-            "六个工具齐全",
+            "七个工具齐全",
         )
 
         emotion, is_error = client.tool("read_emotion_state", {})

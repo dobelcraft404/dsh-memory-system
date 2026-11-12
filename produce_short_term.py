@@ -84,6 +84,7 @@ MIN_IMPORTANCE = 0.6             # 低于该重要度的候选直接丢弃
 MIN_STATEMENT_CHARS = 12
 MAX_STATEMENT_CHARS = 800
 MAX_SESSION_AGE_DAYS = 14        # 太久没动的会话不再回填，避免首次运行爆量
+MAX_SESSION_FAILURES = 3         # 同一会话连续失败多少次后隔离，避免坏会话每轮刷错误
 LOG_LEVEL_DEFAULT = "INFO"
 
 NODE_TIMEOUT_SECONDS = 90
@@ -141,6 +142,8 @@ def atomic_write_text(path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp_name, path)
     finally:
         if os.path.exists(tmp_name):
@@ -203,12 +206,17 @@ def load_state(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        LOGGER.warning("状态文件损坏，将重建：%s（%s）", path, exc)
-        return {"version": PRODUCER_VERSION, "sessions": {}, "seen": {}, "runs": 0}
+        raise ValueError(f"生产者状态不可读，停止以保护待办：{path}（{exc}）") from exc
     if not isinstance(data, dict):
-        return {"version": PRODUCER_VERSION, "sessions": {}, "seen": {}, "runs": 0}
+        raise ValueError(f"生产者状态不是对象，停止以保护待办：{path}")
+    for field in ("sessions", "seen", "pending", "failures", "quarantine"):
+        if field in data and not isinstance(data[field], dict):
+            raise ValueError(f"生产者状态 {field} 不是对象：{path}")
     data.setdefault("sessions", {})
     data.setdefault("seen", {})
+    data.setdefault("pending", {})
+    data.setdefault("failures", {})
+    data.setdefault("quarantine", {})
     data.setdefault("runs", 0)
     return data
 
@@ -381,7 +389,10 @@ def parse_response(raw: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("模型输出顶层不是 JSON 对象")
     items = data.get("memories")
-    memories = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+    if not isinstance(items, list):
+        # 缺字段/类型错是模型没按 schema 输出，不能当成“本会话没有记忆”而消费游标。
+        raise ValueError("memories 字段缺失或不是数组")
+    memories = [item for item in items if isinstance(item, dict)]
     persona_raw = data.get("persona_update")
     persona = None
     if isinstance(persona_raw, str) and persona_raw.strip():
@@ -424,7 +435,7 @@ def read_session_events(node: str, helper: Path, session_file: Path) -> list[dic
         errors="replace",
         timeout=NODE_TIMEOUT_SECONDS,
     )
-    if completed.returncode != 0 and not completed.stdout.strip():
+    if completed.returncode != 0:
         raise RuntimeError(f"解压会话失败（exit {completed.returncode}）：{completed.stderr.strip()[:300]}")
     events: list[dict[str, Any]] = []
     for line in completed.stdout.splitlines():
@@ -452,21 +463,28 @@ def redact_secrets(text: str) -> str:
     return text
 
 
-def build_transcript(events: list[dict[str, Any]], max_chars: int) -> str:
-    """按时间正序拼接；超长时从最旧的开始丢，保留最近上下文。"""
-
+def build_transcript_batch(events: list[dict[str, Any]], max_chars: int) -> tuple[str, int | None]:
+    """保留预算内最早的一段，并返回真正送入模型的最后一条 seq。"""
     lines: list[str] = []
     used = 0
+    last_seq: int | None = None
     for event in events:
         text = redact_secrets(event["text"].strip())
         if len(text) > MAX_MESSAGE_CHARS:
             text = text[:MAX_MESSAGE_CHARS] + "…（已截断）"
         line = f"{'用户' if event['role'] == 'user' else '助手'}：{text}"
-        if used + len(line) > max_chars:
+        needed = len(line) + (2 if lines else 0)
+        if used + needed > max_chars:
             break
         lines.append(line)
-        used += len(line) + 1
-    return "\n\n".join(lines)
+        used += needed
+        last_seq = event["seq"]
+    return "\n\n".join(lines), last_seq
+
+
+def build_transcript(events: list[dict[str, Any]], max_chars: int) -> str:
+    """兼容原调用方；生产者使用 batch 版本同步推进实际消费游标。"""
+    return build_transcript_batch(events, max_chars)[0]
 
 
 def read_persona_text(root: Path) -> str:
@@ -573,13 +591,15 @@ def write_entry(
     memory: dict[str, Any],
     index: int,
 ) -> Path:
-    """写入 short-term/<日期>_<时间>_<会话短名>_<序号>.md。"""
+    """按规范化陈述的 SHA-256 写入稳定文件名，支持崩溃重放。"""
 
     now = now_local()
-    entry_id = f"{now.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-    short_session = re.sub(r"[^0-9A-Za-z]", "", session_id)[-8:] or "session"
-    filename = f"{now.strftime('%Y-%m-%d_%H%M%S')}_{short_session}_{index:02d}.md"
-    target = root / "short-term" / filename
+    digest = sha256_text(normalize_statement(memory["statement"]))
+    entry_id = f"producer-{digest}"
+    target = root / "short-term" / f"{entry_id}.md"
+    # 内容寻址：落盘后、seen 提交前崩溃，重放仍指向同一文件。
+    # 不依赖 exists()，已有文件也以同一内容原子替换，避免半截旧文件。
+
 
     meta = {
         "id": entry_id,
@@ -594,13 +614,7 @@ def write_entry(
     body = f"# {memory['title']}\n\n{memory['statement']}\n"
     text = render_entry(meta, memory["statement"]) + "\n" + body
 
-    try:
-        with open(target, "x", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-    except FileExistsError:
-        target = target.with_name(f"{target.stem}-{uuid.uuid4().hex[:4]}{target.suffix}")
-        with open(target, "x", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
+    atomic_write_text(target, text)
     return target
 
 
@@ -672,6 +686,108 @@ def update_last_session(root: Path, session_id: str, note: str | None, dry_run: 
     return path
 
 
+def drain_pending(root: Path, state: dict[str, Any], state_path: Path,
+                  key: str, budget: int) -> tuple[int, int]:
+    """重放已落盘的抽取结果；每项成功即提交，不再调用模型。"""
+    task = state["pending"][key]
+    written = failures = 0
+    while task["memories"] and written < budget:
+        memory = task["memories"][0]
+        digest = memory["_digest"]
+        if digest not in state["seen"]:
+            try:
+                write_entry(root, task["session_id"], memory, written + 1)
+            except Exception as exc:
+                LOGGER.error("待办 %s 记忆写入失败，保留重试：%s", key, exc)
+                return written, failures + 1
+            state["seen"][digest] = isoformat_seconds(now_local())
+            written += 1
+        task["memories"].pop(0)
+        save_state(state_path, state)
+
+    for field, action in (
+        ("emotion_event", lambda value: update_emotion(root, value, False)),
+        ("persona_update", lambda value: update_persona(root, value, False)),
+        ("session_note", lambda value: update_last_session(root, task["session_id"], value, False)),
+    ):
+        if not task.get(field):
+            continue
+        try:
+            action(task[field])
+        except Exception as exc:
+            LOGGER.warning("待办 %s 的 %s 写入失败，保留重试：%s", key, field, exc)
+            failures += 1
+        else:
+            task[field] = None
+            save_state(state_path, state)
+
+    if not task["memories"] and not any(task.get(f) for f in ("emotion_event", "persona_update", "session_note")):
+        state["sessions"][key] = task["cursor"]
+        del state["pending"][key]
+        save_state(state_path, state)
+    return written, failures
+
+
+def session_signature(session_file: Path) -> dict[str, int]:
+    """会话文件的 (mtime_ns, size) 指纹；文件变了就说明值得重试。"""
+
+    try:
+        stat = session_file.stat()
+    except OSError:
+        return {}
+    return {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+
+
+def record_failure(state: dict[str, Any], key: str, session_file: Path, reason: str) -> bool:
+    """登记一次失败；连续失败达到上限就隔离，返回是否刚被隔离。"""
+
+    value = reason.strip().replace("\n", " ")[:200]
+    previous = state["failures"].get(key)
+    count = int(previous.get("count", 0)) + 1 if isinstance(previous, dict) else 1
+    entry = {
+        "count": count,
+        "reason": value,
+        "at": isoformat_seconds(now_local()),
+        **session_signature(session_file),
+    }
+    if count < MAX_SESSION_FAILURES:
+        state["failures"][key] = entry
+        return False
+    state["failures"].pop(key, None)
+    state["quarantine"][key] = {
+        "reason": value,
+        "attempts": count,
+        "at": entry["at"],
+        **session_signature(session_file),
+    }
+    LOGGER.warning(
+        "会话 %s 连续失败 %d 次，已隔离（会话文件变化后自动重试，或加 --retry-quarantined）：%s",
+        key,
+        count,
+        value,
+    )
+    return True
+
+
+def clear_failure(state: dict[str, Any], key: str) -> None:
+    state["failures"].pop(key, None)
+
+
+def is_quarantined(state: dict[str, Any], key: str, session_file: Path) -> bool:
+    """隔离是否仍然有效；会话文件更新过就自动解除，避免“修好了还不动”。"""
+
+    entry = state["quarantine"].get(key)
+    if not isinstance(entry, dict):
+        return False
+    current = session_signature(session_file)
+    if current and entry.get("mtime_ns") == current.get("mtime_ns") and entry.get("size") == current.get("size"):
+        return True
+    LOGGER.info("会话 %s 的隔离已失效（文件有更新），重新尝试", key)
+    state["quarantine"].pop(key, None)
+    state["failures"].pop(key, None)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
@@ -692,26 +808,46 @@ def process(
     limit: int | None,
     dry_run: bool,
     no_llm: bool,
+    retry_quarantined: bool = False,
 ) -> int:
     state_path = root / "state" / "producer_state.json"
     lock_path = root / ".locks" / "producer.lock"
 
     with FileLock(lock_path):
         state = load_state(state_path)
+        state.setdefault("pending", {})
+        state.setdefault("failures", {})
+        state.setdefault("quarantine", {})
+        if retry_quarantined and state["quarantine"]:
+            LOGGER.info("--retry-quarantined：解除 %d 个会话的隔离", len(state["quarantine"]))
+            state["quarantine"].clear()
+            state["failures"].clear()
         sessions = find_sessions(sessions_root)
         LOGGER.info("发现会话文件 %d 个", len(sessions))
         config: dict[str, str] | None = None
-        if not no_llm:
-            config = load_llm_config(root)
-            LOGGER.info("LLM：%s @ %s", config["model"], config["base_url"])
+        # 待办重放不依赖模型配置；确实需要新抽取时再加载。
 
         cutoff = now_local() - timedelta(days=MAX_SESSION_AGE_DAYS)
         persona_text = read_persona_text(root)
         if persona_text:
             LOGGER.info("已有关系档案：%d 字", len(persona_text))
         written = 0
+        failures = 0
         processed_sessions = 0
+        quarantined_skipped = 0
         api_calls = 0  # 只在确实有新消息、且需要模型时才递增，用于证明空跑不花钱
+
+        # 旧待办优先重放，即使源会话已移走也能完成；同轮不再重抽该会话。
+        resumed = set(state["pending"])
+        if not dry_run and not no_llm:
+            for pending_key in list(state["pending"]):
+                count, errors = drain_pending(
+                    root, state, state_path, pending_key,
+                    min(MAX_MEMORIES_PER_SESSION, MAX_MEMORIES_PER_RUN - written),
+                )
+                written += count
+                failures += errors
+            persona_text = read_persona_text(root)
 
         for session_file in sessions:
             if limit is not None and processed_sessions >= limit:
@@ -722,6 +858,11 @@ def process(
                 continue
 
             key = str(session_file.relative_to(sessions_root)).replace("\\", "/")
+            if is_quarantined(state, key, session_file):
+                quarantined_skipped += 1
+                continue
+            if key in resumed:
+                continue
             entry = state["sessions"].get(key)
             minimum_seq = -1
             if isinstance(entry, dict) and isinstance(entry.get("max_seq"), int):
@@ -730,7 +871,15 @@ def process(
                 LOGGER.debug("跳过过期会话：%s（最后修改 %s）", key, mtime.isoformat())
                 continue
 
-            events = read_session_events(node, helper, session_file)
+            try:
+                events = read_session_events(node, helper, session_file)
+            except Exception as exc:  # 单个坏会话不能拖死其它会话
+                LOGGER.error("会话 %s 读取失败，跳过（下次重试）：%s", key, exc)
+                failures += 1
+                if not dry_run:
+                    record_failure(state, key, session_file, f"读取失败：{exc}")
+                    save_state(state_path, state)
+                continue
             new_events = [event for event in events if event["seq"] > minimum_seq]
             if not new_events:
                 continue
@@ -739,9 +888,12 @@ def process(
                 LOGGER.info("会话 %s 新增 %d 条，本轮处理最早 %d 条", key, len(new_events), MAX_BACKLOG_MESSAGES)
                 new_events = new_events[:MAX_BACKLOG_MESSAGES]
 
-            seq_to_mark = max(event["seq"] for event in new_events)
-            transcript = build_transcript(new_events, MAX_TRANSCRIPT_CHARS)
-            if not transcript:
+            # 不够容纳一个会话的最大产出时留到下轮，不能截掉候选后提交游标。
+            if not dry_run and MAX_MEMORIES_PER_RUN - written < MAX_MEMORIES_PER_SESSION:
+                LOGGER.info("本轮剩余写入额度不足一个完整会话，留到下次")
+                break
+            transcript, seq_to_mark = build_transcript_batch(new_events, MAX_TRANSCRIPT_CHARS)
+            if not transcript or seq_to_mark is None:
                 continue
 
             processed_sessions += 1
@@ -751,30 +903,62 @@ def process(
                 LOGGER.info("--no-llm：跳过模型抽取")
                 continue
 
-            assert config is not None
+            if config is None:
+                config = load_llm_config(root)
+                LOGGER.info("LLM：%s @ %s", config["model"], config["base_url"])
             prompt = build_prompt(transcript, key, persona_text)
             api_calls += 1
-            raw = call_llm(config, prompt)
             try:
-                parsed = parse_response(raw)
-            except (json.JSONDecodeError, ValueError) as exc:
-                # 三合一输出比纯记忆更长，偶发截断/转义错误；重试一次，仍失败则放弃本次会话。
-                LOGGER.warning("模型输出不是合法 JSON（%s），重试一次", exc)
-                api_calls += 1
                 raw = call_llm(config, prompt)
-                parsed = parse_response(raw)
+                try:
+                    parsed = parse_response(raw)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    # 三合一输出比纯记忆更长，偶发截断/转义错误；重试一次，仍失败则跳过本会话。
+                    LOGGER.warning("模型输出不可用（%s），重试一次", exc)
+                    api_calls += 1
+                    raw = call_llm(config, prompt)
+                    parsed = parse_response(raw)
+            except Exception as exc:  # 单个会话失败不阻塞其它会话，游标也不推进
+                LOGGER.error("会话 %s 模型调用/解析失败，跳过（下次重试）：%s", session_id, exc)
+                failures += 1
+                if not dry_run:
+                    record_failure(state, key, session_file, f"模型调用/解析失败：{exc}")
+                    save_state(state_path, state)
+                continue
             items = parsed["memories"]
             candidates = [sanitize_candidate(item) for item in items]
             candidates = [item for item in candidates if item is not None]
+            # 模型确实返回了条目却一条都过不了字段校验：这是 schema 违约，
+            # 不能当成“本会话没有记忆”而消费游标，否则整段内容被静默丢掉。
+            if items and not candidates:
+                LOGGER.error("会话 %s：模型返回 %d 条但全部校验失败，不推进游标（下次重试）", session_id, len(items))
+                failures += 1
+                if not dry_run:
+                    record_failure(state, key, session_file, "memories 字段全部校验失败")
+                    save_state(state_path, state)
+                continue
 
             kept: list[dict[str, Any]] = []
+            batch_seen: set[str] = set()
             for candidate in candidates:
                 digest = sha256_text(normalize_statement(candidate["statement"]))
-                if digest in state["seen"]:
+                if digest in state["seen"] or digest in batch_seen:
                     continue
+                batch_seen.add(digest)
                 candidate["_digest"] = digest
                 kept.append(candidate)
-            kept = kept[: min(MAX_MEMORIES_PER_SESSION, MAX_MEMORIES_PER_RUN - written)]
+            # 单会话最多写 6 条；超出时本轮先写前 6 条且不推进游标，
+            # 已写条目记入 seen，下轮去重后继续，避免超额候选被静默丢弃。
+            overflow = len(kept) > MAX_MEMORIES_PER_SESSION
+            if overflow:
+                LOGGER.warning(
+                    "会话 %s 候选 %d 条，超过单会话上限 %d；本轮先写 %d 条，游标不推进",
+                    session_id,
+                    len(kept),
+                    MAX_MEMORIES_PER_SESSION,
+                    MAX_MEMORIES_PER_SESSION,
+                )
+            # 保留完整候选列表，超额部分进入持久化待办。
 
             LOGGER.info(
                 "模型返回 %d 条记忆，校验后 %d 条，去重后 %d 条；情绪=%s，人格重写=%s",
@@ -785,38 +969,32 @@ def process(
                 "是" if parsed["persona_update"] else "否",
             )
 
-            for index, memory in enumerate(kept, start=1):
-                if dry_run:
-                    LOGGER.info("[dry-run] 将写入：%s", memory["statement"][:100])
-                    continue
-                path = write_entry(root, session_id, memory, index)
-                state["seen"][memory["_digest"]] = isoformat_seconds(now_local())
-                written += 1
-                LOGGER.info("已写入短期记忆：%s", path.relative_to(root))
-
-            # 情绪 / 关系档案 / 接续句：与记忆复用同一次模型调用，零额外请求。
-            try:
-                if parsed["emotion_event"]:
-                    update_emotion(root, parsed["emotion_event"], dry_run)
-                if parsed["persona_update"]:
-                    update_persona(root, parsed["persona_update"], dry_run)
-                if parsed["session_note"]:
-                    update_last_session(root, session_id, parsed["session_note"], dry_run)
-            except OSError as exc:
-                LOGGER.warning("情绪/人格/接续句写入失败（不影响记忆）：%s", exc)
-
             if dry_run:
+                for memory in kept:
+                    LOGGER.info("[dry-run] 将写入：%s", memory["statement"][:100])
                 continue
 
+            state["pending"][key] = {
+                "session_id": session_id,
+                "memories": kept,
+                "emotion_event": parsed["emotion_event"],
+                "persona_update": parsed["persona_update"],
+                "session_note": parsed["session_note"],
+                "cursor": {
+                    "max_seq": seq_to_mark,
+                    "updated_at": isoformat_seconds(now_local()),
+                    "mtime": int(mtime.timestamp()),
+                },
+            }
+            # 必须先提交抽取结果，再产生任何外部文件副作用。
+            save_state(state_path, state)
+            count, errors = drain_pending(root, state, state_path, key, MAX_MEMORIES_PER_SESSION)
+            written += count
+            failures += errors
+            if not errors:
+                clear_failure(state, key)
             if parsed["persona_update"]:
                 persona_text = read_persona_text(root)
-
-            # 只有成功处理完（哪怕 0 条）才推进 max_seq；模型失败时不推进，下次重试。
-            state["sessions"][key] = {
-                "max_seq": seq_to_mark,
-                "updated_at": isoformat_seconds(now_local()),
-                "mtime": int(mtime.timestamp()),
-            }
             if written >= MAX_MEMORIES_PER_RUN:
                 LOGGER.warning("本次已达到写入上限 %d 条，剩余会话留到下次", MAX_MEMORIES_PER_RUN)
                 break
@@ -829,10 +1007,17 @@ def process(
             written,
             api_calls,
         )
+        if quarantined_skipped:
+            LOGGER.warning(
+                "跳过已隔离会话 %d 个（文件更新后自动重试，或加 --retry-quarantined 强制重试）",
+                quarantined_skipped,
+            )
         if api_calls == 0:
             # 空跑证明：没有新消息时一个 API 请求都不发。
             LOGGER.info("本次无新消息或未启用模型：未调用模型（0 API 请求）")
-    return 0
+        if failures:
+            LOGGER.error("本轮发生 %d 处处理失败；退出码 1，请检查以上日志", failures)
+    return 1 if failures else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -842,6 +1027,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=None, help="本次最多处理多少个会话")
     parser.add_argument("--dry-run", action="store_true", help="调用模型但不写文件/状态")
     parser.add_argument("--no-llm", action="store_true", help="只统计新增消息，不调用模型")
+    parser.add_argument(
+        "--retry-quarantined",
+        action="store_true",
+        help="解除所有已隔离会话，强制重试（会话文件变化时会自动解除，一般不需要）",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -873,6 +1063,7 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             dry_run=args.dry_run,
             no_llm=args.no_llm,
+            retry_quarantined=args.retry_quarantined,
         )
     except (RuntimeError, OSError, urlerror.URLError) as exc:
         LOGGER.error("运行失败：%s", exc)

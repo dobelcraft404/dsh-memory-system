@@ -46,6 +46,31 @@ MCP 服务端 `memory_system.py` 只读多、写少：主模型**不许**直接�
 | `archive_search` | 关键词检索归档索引 |
 | `archive_read` | 读归档全文 |
 | `archive_write` | 写归档：自动建目录、生成摘要与元数据、更新索引 |
+| `session_search` | 在历史会话**原文**里按关键词检索（见下节） |
+
+## 会话原文检索（session_search）
+
+记忆层只沉淀结论、归档层只放可复用笔记，两者都不保留对话原文。想回答「我上次是不是说过这句话 / 你当时怎么答的」，
+用 `session_search` 直接翻 DSH 的会话文件（`~/.dsh/sessions/**/session.v4.jsonl.zstd`，多帧 zstd，由 `tools/read_session.js` 切帧解压）：
+
+- `query` 必填，空格/逗号分词，**全部命中**才算（AND）；`role` 可选 `any` / `user` / `assistant`，
+  `session`（会话名子串）、`days`（只要最近 N 天改动过的会话）、`limit`（1~50）可选；
+- 返回 `session` / `session_id` / `seq` / `time` / `role` / `score` / `snippet`，按时间倒序；
+- 解析结果缓存到 `state/session-cache/`，按 `mtime_ns + size` 失效，第二次查询基本不再解压（返回里带 `cache_hits`）；
+- 插件注入的 user 消息（`source.kind` 不是 `user`，例如 `dsh-time-context`、`dsh-emotion-context`）**不进索引**，
+  避免把注入文本当成用户发言；
+- 会话根默认 `~/.dsh/sessions`，可用环境变量 `DSH_SESSIONS_ROOT` 覆盖；
+- 不依赖 MCP 也能用：`python -X utf8 memory_system.py --search "关键词" --role user --limit 10`。
+
+## 生产者的健壮性（游标 / 失败隔离）
+
+`produce_short_term.py` 的原则是**宁可少提炼，也不能把没提炼的内容跨过去**：
+
+- 游标只推进到「真正送进模型并成功提交」的最后一条 seq；
+- 应答解析失败（`memories` 缺失或不是数组）直接抛错，不当成「本会话没有记忆」消费游标；
+- 模型返回候选但**全部校验失败**时，记 ERROR、登记失败、不推进游标；
+- 单会话 backlog 超过 40 条只取最早一批；写入额度不足一个会话时不截断、候选进 `state["pending"]`，下次 `drain_pending` 补写；
+- 同一会话连续失败 3 次自动隔离（`state["quarantine"]`），不再每轮重试；会话文件 `mtime/size` 变化后自动解除，或手动 `--retry-quarantined`。
 
 ## 记忆衰减（用进废退）
 
@@ -115,7 +140,9 @@ sudo systemctl enable --now memory-consolidate.timer memory-session-flush.timer
 python tests/build_decay_fixture.py   # 造一份衰减测试数据
 python tests/check_decay_access.py    # 校验衰减与索引
 python tests/check_self_state.py      # 校验情绪/关系档案读取
-python tests/smoke_mcp.py             # MCP 六个工具冒烟
+python tests/smoke_mcp.py             # MCP 七个工具冒烟
+python tests/test_session_search.py   # 会话检索（造两个多帧 zstd 会话）
+python tests/test_producer_guards.py  # 生产者游标守卫与失败隔离
 ```
 
 ## 目录结构
@@ -152,5 +179,6 @@ MIT，见 [LICENSE](LICENSE)。Copyright (c) 2026 dobelcraft404。
 
 ## 更新日志
 
+- **2026-11-12**：新增 `session_search`（会话原文检索 + `state/session-cache` 缓存，工具数 6 → 7）；`produce_short_term.py` 加游标守卫与失败隔离（`state["quarantine"]`、`--retry-quarantined`）；补 `tests/test_session_search.py`、`tests/test_producer_guards.py`。
 - **2026-11-08**：归档层改为默认主动检索；`SUGGESTIONS.md` 只保留最近 7 天；新增 DPAPI 加密日记；Windows 定时任务改为 `wscript` 静默启动（消除窗口闪烁与焦点抢占）；新增沙箱单目录授权脚本。
 - **2026-11-06**：首个公开版本，四层结构 + MCP 工具 + 衰减机制。

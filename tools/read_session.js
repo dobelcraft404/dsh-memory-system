@@ -15,6 +15,11 @@
  *   {"seq":13,"time":...,"role":"assistant","text":"..."}
  * 只输出 user/message 与 assistant/message 的 text 块；跳过 reasoning、工具调用、
  * 工具结果，避免把大量日志喂给提炼模型。解析失败的行静默跳过。
+ *
+ * 插件注入的 user 消息（source.kind 不是 "user"）一律跳过：
+ * 例如 dsh-time-context 的 "[Time sampled ...]"、dsh-emotion-context 的
+ * "[情绪状态 · 自动注入]"。它们不是用户说的话，喂给提炼模型会把噪音
+ * 误当成用户情绪/偏好。
  */
 
 'use strict';
@@ -49,13 +54,15 @@ if (offsets.length === 0) {
 }
 
 let text = '';
+let failed = false;
 for (let i = 0; i < offsets.length; i += 1) {
   const start = offsets[i];
   const end = i + 1 < offsets.length ? offsets[i + 1] : buf.length;
   try {
     text += zlib.zstdDecompressSync(buf.subarray(start, end)).toString('utf8');
   } catch (err) {
-    // 单帧损坏不应让整个会话不可读；记录到 stderr，继续后面的帧。
+    // 可输出诊断用的完整帧，但非零退出，禁止生产者跨过缺口提交游标。
+    failed = true;
     process.stderr.write(`frame ${i} failed: ${err.message}\n`);
   }
 }
@@ -69,17 +76,23 @@ function collect(content) {
     .trim();
 }
 
+process.exitCode = failed ? 1 : 0;
 for (const line of text.split('\n')) {
   if (!line.trim()) continue;
   let event;
   try {
     event = JSON.parse(line);
   } catch {
+    process.exitCode = 1;
+    process.stderr.write('invalid JSONL record\n');
     continue;
   }
   let role = '';
   let body = '';
   if (event.type === 'user/message' && event.data) {
+    const kind = event.data.source && event.data.source.kind;
+    // 只保留真人输入；time-context / emotion-context 等插件的注入不算用户发言。
+    if (typeof kind === 'string' && kind !== 'user') continue;
     role = 'user';
     body = collect(event.data.content);
   } else if (event.type === 'assistant/message' && event.data && event.data.message) {

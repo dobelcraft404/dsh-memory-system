@@ -6,7 +6,7 @@
 
 ## 零、破坏性操作红线（最高优先级，优先于本文件其余全部条款）
 
-> 立此条款的直接原因：2026-11-05，本机一条清理脚本因 `$home` 赋值失败，实际执行了 `Remove-Item -LiteralPath C:\Users\<用户名> -Recurse -Force`，删掉整个用户目录——DSH 48 条历史会话、全部插件、启动器登录插件、网易云本地数据全部丢失。详见归档 `archive/computer-science/operating-systems/2026-11/2026-11-05_PowerShell-误删整个用户目录…`。
+> 立此条款的直接原因：2026-11-05，本机一条清理脚本因 `$home` 赋值失败，实际执行了 `Remove-Item -LiteralPath C:\Users\25351 -Recurse -Force`，删掉整个用户目录——DSH 48 条历史会话、全部插件、启动器登录插件、网易云本地数据全部丢失。详见归档 `archive/computer-science/operating-systems/2026-11/2026-11-05_PowerShell-误删整个用户目录…`。
 
 1. **删除、移动、覆盖之前，先解析再校验绝对路径。** 用 `[System.IO.Path]::GetFullPath($p)` 得到真实路径并确认它就是要动的那个；禁止对 `C:\Users\<用户>`、`C:\Users`、盘符根、`C:\Windows`、`C:\Program Files`、`C:\Program Files (x86)`、`C:\ProgramData` 及其祖先做任何递归删除。
 2. **禁止用 `$home`、`$profile`、`$PSHOME`、`$env:*` 等自动变量/保留名当路径变量。** 一律用 `$targetPath`、`$cleanupRoot` 这类名字，并在使用前 `if (-not $targetPath) { throw }`。
@@ -105,7 +105,8 @@ DSH 的 MCP 工具名会带服务器前缀，本系统的 `serverName` 是 `memo
 | `archive_read` | `mcp__memory__archive_read` | 读取指定归档全文 |
 | `get_memory_index` | `mcp__memory__get_memory_index` | 读取长期/中期记忆索引 |
 | `read_memory_entry` | `mcp__memory__read_memory_entry` | 按 id 读取记忆全文 |
-| `read_emotion_state` | `mcp__memory__read_emotion_state` | 读取当前情绪与风格提示 |
+| `read_emotion_state` | `mcp__memory__read_emotion_state` | 读取关系档案与会话接续（情绪已改为自动注入，见第七节） |
+| `session_search` | `mcp__memory__session_search` | 在历史会话原文里按关键词检索（见第五节之二） |
 
 如果工具列表里没有这些名字，说明 MCP 服务未加载或 DSH 未重启；按“初始化检查”处理，不要用文件系统工具硬凑。
 
@@ -115,8 +116,8 @@ DSH 的 MCP 工具名会带服务器前缀，本系统的 `serverName` 是 `memo
 
 1. **确认策略已读。** 如果本文件内容还不在当前上下文里，先用 `read` 读取一次；已经读过就跳过。
 2. **确认工具可用。** 看当前工具列表里是否有 `mcp__memory__*`。没有时告诉用户：需要在 `cordis.patch.yml` 启用 `@deepseek-ai/dsh-mcp-client`，运行 `dsh --profile web --dump-config` 确认退出码 0，然后重启 DSH。不要假装工具存在。
-3. **读一次自我状态。** 调用 `mcp__memory__read_emotion_state`，一次拿到情绪、`style_hint`、`persona_summary`（关系档案）和 `last_session`（上次聊到哪）。用它们调整语气和开场，但不要逐字复述给用户；失败就用“平静、简洁”的默认风格，不阻塞任务。
-4. **默认主动用归档，但不预加载全量索引。** 归档层不是死档案：话题涉及历史、偏好、路径、决定、踩坑结论时，由主模型自行先 `archive_search`，不用等用户开口；会话间隔 ≥6 小时且 `last_session.note` 有未了事项时，用主题关键词查一次索引。只查索引，命中才 `archive_read`；不读全量 `INDEX.md`。`get_memory_index` 仍只在记忆检索需要时调用。
+3. **情绪已自动注入，不要主动读。** 本机装了 `dsh-emotion-context` 插件：每个会话首次、情绪变化时、以及每隔一段时间，DSH 会自动把 `emotion` / `intensity` / 分档说明 / `style_hint` / `reason` 作为一条 `[情绪状态 · 自动注入]` 消息追加到对话末尾。看到那段就直接用它调整语气，**不要调用 `mcp__memory__read_emotion_state` 去读情绪**。只有确实需要 `persona_summary`（关系档案）或 `last_session`（上次聊到哪）时才调这个工具，一次拿全、不重复调；没注入块又没读到，就用“平静、简洁”的默认风格，不阻塞任务。
+4. **默认主动用归档，但不预加载全量索引。** 归档层不是死档案：话题涉及历史、偏好、路径、决定、踩坑结论时，由主模型自行先 `archive_search`，不用等用户开口；会话间隔 ≥6 小时且 `last_session.note` 有未了事项时，用主题关键词查一次索引。只查索引，命中才 `archive_read`；不读全量 `INDEX.md`。`get_memory_index` 仍只在记忆检索需要时调用；问的是「上次说过什么」这类原文级问题，用 `session_search`（见第五节之二）。
 5. **文件缺失时。** 如果工具返回 `index_missing`、`file_not_found` 等初始化错误，提示用户运行：
    - Windows：`powershell -ExecutionPolicy Bypass -File D:\dsh-memory-system\init_memory_system.ps1`
    - Linux/macOS/WSL：`bash ~/.dsh/memory-system/init_memory_system.sh`
@@ -208,6 +209,17 @@ DSH 的 MCP 工具名会带服务器前缀，本系统的 `serverName` 是 `memo
 6. **零命中。** 直接说“索引里没找到”，建议换关键词或补归档；禁止遍历目录碰运气。
 7. **索引损坏/缺失。** 报告具体错误，提示运行初始化/修复；主模型不要重写 `INDEX.md`。
 
+## 五之二、会话检索流程（session_search）
+
+记忆层只沉淀结论、归档层只放可复用笔记，两者都不保留对话原文。涉及「我上次是不是说过这件事 / 你当时怎么回答的」这类问题，先走会话原文检索，不要凭印象编：
+
+1. 调 `mcp__memory__session_search`，`query` 用问题里的关键词（空格/逗号分词，**全部命中**才算，所以别一次塞太多词）；需要只看真人发言时传 `role: "user"`，只看某场会话时传 `session`（会话名子串）。
+2. 看返回的 `session` / `seq` / `time` / `role` / `snippet` 定位；`seq` 是该会话内的消息序号，可用于引用。命中超过一屏时用 `limit` 收敛。
+3. 回答时标明是「会话原文命中」还是「归档/记忆里的结论」；`snippet` 只够定位，具体措辞不确定时再缩小关键词查一次。
+4. **不主动翻全集。** 没人问就别扫；`session_search` 会解压全量会话，首次较慢（缓存建好后快）。
+5. 返回 `note` 里的“有解压失败的帧”表示该会话可能不完整，结论要留余地。
+6. 未加载 MCP 时的退路：`python -X utf8 D:\dsh-memory-system\memory_system.py --search "关键词"`。
+
 ## 六、记忆检索流程
 
 1. 先调 `mcp__memory__get_memory_index("long-term")`，看 `title` / `summary` / `tags` / `confidence` 筛选。
@@ -226,7 +238,10 @@ DSH 的 MCP 工具名会带服务器前缀，本系统的 `serverName` 是 `memo
 
 ## 七、情绪、关系档案与会话接续
 
-- 这三类动态状态只通过 `mcp__memory__read_emotion_state` 一次读取，**绝不写入 System Prompt**，也不要把数值抄进长期上下文。
+- **情绪不再通过工具主动读取。** `dsh-emotion-context` 插件在每次 `agent/pre-step` 阶段读取 `D:\dsh-memory-system\emotion-state.md`，把一段 `[情绪状态 · 自动注入]` 追加到对话末尾（机制与 `dsh-time-context` 相同）。看到那段就直接用，**不要调 `mcp__memory__read_emotion_state` 读情绪**，也不要因为没调工具就说读不到情绪。
+- 注入频率：每个会话首次必注入；情绪状态变化立即注入；其余情况每 10 分钟最多刷新一次（`refreshIntervalMs` 可配）。所以可能不是每轮都有一条，这是正常的。
+- `mcp__memory__read_emotion_state` 仍然保留，只在需要 `persona_summary`（关系档案）和 `last_session`（上次聊到哪）时调用；它返回的 `emotion` / `intensity` / `style_hint` 与注入块同源，重复时以注入块为准。
+- 动态状态**绝不写入 System Prompt**，也不要把数值抄进长期上下文。
 - 返回字段（顺序固定）：`emotion`、`intensity`（0~1）、`updated_at`、`ttl_hours`、`reason`、`style_hint`、`source`、`persona_summary`、`persona_updated_at`、`last_session`。
 - `persona_summary` 是后台从对话里沉淀的“关于你这个人”的稳定信息（称呼、喜好、雷点、约定），可能含 `[推测]` 标记；把它当作背景常识，不要逐条念给用户，也不要因为写了就认定绝对准确。
 - `last_session` 含 `session_id` / `note` / `updated_at` / `age_hours`。开场只在 `age_hours ≥ 6` 且 `note` 提到未完成的事时，自然地接一句；别每次都说“欢迎回来”。
@@ -246,7 +261,8 @@ DSH 的 MCP 工具名会带服务器前缀，本系统的 `serverName` 是 `memo
 ### 对主模型（MEMORY-POLICY.md）
 - System Prompt 和工具定义全程静态不变，禁止将任何动态内容（记忆、情绪、索引）注入 System Prompt。
 - 所有动态数据必须通过工具调用获取，工具返回结果作为对话消息追加到末尾。
-- 情绪状态通过 `read_emotion_state()` 工具读取，不写入 System Prompt。
+- 情绪由 `dsh-emotion-context` 插件在 `agent/pre-step` 阶段注入为对话末尾的一条 user 消息（`source.kind = "emotion-context"`），绝不写入 System Prompt；`read_emotion_state()` 只留给 persona/last_session。
+- 插件注入的 user 消息不是用户发言：`D:\dsh-memory-system\tools\read_session.js` 抽取会话时跳过 `source.kind` 不是 `"user"` 的 user 消息（time-context / emotion-context / runtime-context / skill-catalog / agent-instructions 等），避免 `produce_short_term.py` 把注入文本误当成用户情绪事件反写 `emotion-state.md`。
 
 ### 对插件代码（memory_system.py）
 - 工具注册列表必须按工具名字母序固定排列，保证每次请求的 `tools` 数组字节级一致。
@@ -284,12 +300,12 @@ DSH 的 MCP 工具名会带服务器前缀，本系统的 `serverName` 是 `memo
 ## 十一、初始化目录参考
 
 ```
-D:\dsh-memory-system\          （规范路径 C:\Users\<用户名>\.dsh\memory-system 是指向它的 junction）
+D:\dsh-memory-system\          （规范路径 C:\Users\25351\.dsh\memory-system 是指向它的 junction）
 ├── MEMORY-POLICY.md
 ├── emotion-state.md            情绪（生产者写入事件，consolidate 负责衰减）
 ├── persona.md                  关系档案（生产者整体重写，主模型只读）
 ├── EMOTION-STYLES.md
-├── memory_system.py           MCP stdio 服务端（6 个只读/写入工具）
+├── memory_system.py           MCP stdio 服务端（7 个只读/写入工具）
 ├── consolidate_memory.py      后台增量整理脚本（6 小时幂等）
 ├── produce_short_term.py      会话 → 短期记忆生产者（调 flash 模型）
 ├── init_memory_system.sh      Linux/macOS/WSL 初始化

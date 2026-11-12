@@ -25,6 +25,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from contextlib import contextmanager
@@ -947,6 +949,334 @@ def read_emotion_state(root: Path, args: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# 会话原文检索（session_search）
+#
+# 记忆层只沉淀结论，归档是“可复用结论库”，两者都不保存对话全文。
+# 因此“我以前说过什么 / 那句话在哪场会话”这类问题需要一个独立入口：
+# 直接读 .dsh/sessions 下多帧 zstd 压缩的会话文件，按关键词搜真实发言。
+#
+# 设计约束：
+# 1. 只读会话文件；解压结果落在 state/session-cache/ 作为缓存，不是记忆数据。
+# 2. 解压复用 tools/read_session.js（Node 22+ 原生 zstd），Python 侧只做切分与检索。
+# 3. 缓存按 (路径, mtime, size) 失效；解压失败时保留已解出的部分并标记 partial，
+#    检索是只读场景，宁可给残缺结果也不能整个失败。
+# ---------------------------------------------------------------------------
+SESSIONS_ROOT_DEFAULT = Path.home() / ".dsh" / "sessions"
+SESSION_CACHE_RELATIVE = "state/session-cache"
+SESSION_CACHE_VERSION = 1
+MAX_SESSION_RESULTS = 50
+DEFAULT_SESSION_RESULTS = 20
+MAX_SESSION_SCAN = 200
+SESSION_SNIPPET_CHARS = 160
+SESSION_MAX_HITS = 500
+NODE_TIMEOUT_SECONDS = 90
+MAX_CACHE_FILES = 200
+
+
+def _sessions_root() -> Path:
+    raw = os.environ.get("DSH_SESSIONS_ROOT", "").strip()
+    return Path(raw).expanduser() if raw else SESSIONS_ROOT_DEFAULT
+
+
+def _resolve_node() -> str | None:
+    node = shutil.which("node")
+    if node:
+        return node
+    for candidate in (
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "nodejs" / "node.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "nodejs" / "node.exe",
+    ):
+        try:
+            if candidate.is_file():
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
+def _session_cache_dir(root: Path) -> Path:
+    path = root / SESSION_CACHE_RELATIVE
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return path
+
+
+def _cache_files(root: Path, session_file: Path) -> tuple[Path, Path]:
+    key = hashlib.sha1(str(session_file.resolve()).encode("utf-8")).hexdigest()[:16]
+    directory = _session_cache_dir(root)
+    return directory / f"{key}.json", directory / f"{key}.meta.json"
+
+
+def _prune_cache(directory: Path) -> None:
+    try:
+        files = sorted(
+            (item for item in directory.iterdir() if item.suffix == ".json" and not item.name.endswith(".meta.json")),
+            key=lambda item: item.stat().st_mtime,
+        )
+    except OSError:
+        return
+    for stale in files[: max(0, len(files) - MAX_CACHE_FILES)]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def _normalize_time(value: Any) -> str:
+    """会话里的 time 是毫秒时间戳（字符串或数字），转成可读的本地时间。"""
+
+    raw = value
+    if isinstance(raw, str) and raw.strip().isdigit():
+        raw = int(raw.strip())
+    if isinstance(raw, (int, float)) and raw > 0:
+        stamp = float(raw)
+        if stamp > 1e11:  # 毫秒
+            stamp /= 1000.0
+        try:
+            return datetime.fromtimestamp(stamp).strftime("%Y-%m-%d %H:%M:%S")
+        except (OSError, OverflowError, ValueError):
+            return ""
+    return str(value or "")
+
+
+def _decompress_session(root: Path, session_file: Path, node: str) -> dict[str, Any]:
+    """解压一个会话文件，返回 {"events": [...], "partial": bool, "error": str}。"""
+
+    helper = root / "tools" / "read_session.js"
+    if not helper.is_file():
+        # 允许 root 与代码目录分离（测试/多实例），退回到脚本同级的 tools/。
+        helper = Path(__file__).resolve().parent / "tools" / "read_session.js"
+    if not helper.is_file():
+        raise ToolFailure("helper_missing", f"找不到会话解压脚本：{helper}")
+    try:
+        completed = subprocess.run(
+            [node, str(helper), str(session_file)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=NODE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        raise ToolFailure("timeout", f"解压会话超时（>{NODE_TIMEOUT_SECONDS}s）：{session_file.name}")
+    except OSError as exc:
+        raise ToolFailure("node_failed", f"无法启动 node：{exc}")
+    events: list[dict[str, Any]] = []
+    for line in completed.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("role") not in ("user", "assistant"):
+            continue
+        text = event.get("text")
+        seq = event.get("seq")
+        if isinstance(text, str) and text.strip() and isinstance(seq, int):
+            events.append(
+                {
+                    "seq": seq,
+                    "time": _normalize_time(event.get("time")),
+                    "role": event["role"],
+                    "text": text,
+                }
+            )
+    partial = completed.returncode != 0
+    error = (completed.stderr.strip()[:300] if partial else "")
+    return {"events": events, "partial": partial, "error": error}
+
+
+def _load_session(root: Path, session_file: Path, node: str) -> tuple[list[dict[str, Any]], bool, bool]:
+    """读缓存或重解压；返回 (events, partial, from_cache)。"""
+
+    cache_path, meta_path = _cache_files(root, session_file)
+    try:
+        stat = session_file.stat()
+    except OSError as exc:
+        raise ToolFailure("session_unreadable", f"会话文件不可读：{exc}")
+    signature = {"version": SESSION_CACHE_VERSION, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+    if cache_path.is_file() and meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(meta, dict) and all(meta.get(key) == value for key, value in signature.items()):
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                events = cached.get("events") if isinstance(cached, dict) else None
+                if isinstance(events, list):
+                    return events, bool(cached.get("partial", False)), True
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    result = _decompress_session(root, session_file, node)
+    events = result["events"]
+    try:
+        atomic_write_text(
+            cache_path,
+            json.dumps({"events": events, "partial": result["partial"]}, ensure_ascii=False),
+        )
+        atomic_write_text(meta_path, json.dumps(signature, ensure_ascii=False))
+        _prune_cache(cache_path.parent)
+    except OSError:
+        # 缓存写不进去不影响检索，只是下次仍要重解压。
+        pass
+    return events, bool(result["partial"]), False
+
+
+def _make_snippet(text: str, tokens: list[str], width: int = SESSION_SNIPPET_CHARS) -> str:
+    flat = " ".join(text.split())
+    lowered = flat.lower()
+    index = -1
+    for token in tokens:
+        found = lowered.find(token)
+        if found >= 0 and (index < 0 or found < index):
+            index = found
+    if index < 0:
+        index = 0
+    half = max(1, width // 2)
+    start = max(0, index - half)
+    end = min(len(flat), start + width)
+    start = max(0, end - width)
+    snippet = flat[start:end]
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(flat):
+        snippet = snippet + "…"
+    return snippet
+
+
+def session_search(root: Path, args: dict[str, Any]) -> dict[str, Any]:
+    """在历史会话原文里找关键词命中，返回带上下文的片段。只读。"""
+
+    query = str(args.get("query", "")).strip()
+    if not query:
+        raise ToolFailure("invalid_argument", "query 不能为空")
+
+    try:
+        limit = int(args.get("limit", DEFAULT_SESSION_RESULTS) or DEFAULT_SESSION_RESULTS)
+    except (TypeError, ValueError):
+        limit = DEFAULT_SESSION_RESULTS
+    limit = max(1, min(limit, MAX_SESSION_RESULTS))
+
+    role = str(args.get("role", "any") or "any").strip().lower()
+    if role not in ("any", "user", "assistant"):
+        raise ToolFailure("invalid_argument", "role 只能是 any / user / assistant")
+
+    try:
+        days = int(args.get("days", 0) or 0)
+    except (TypeError, ValueError):
+        days = 0
+    days = max(0, days)
+
+    session_filter = str(args.get("session", "") or "").strip()
+
+    tokens = [token.lower() for token in re.split(r"[\s,，;；]+", query) if token.strip()]
+    phrase = query.lower()
+
+    sessions_root = _sessions_root()
+    if not sessions_root.is_dir():
+        return {
+            "ok": True,
+            "query": query,
+            "tokens": tokens,
+            "count": 0,
+            "total_hits": 0,
+            "scanned_sessions": 0,
+            "matched_sessions": 0,
+            "cache_hits": 0,
+            "truncated": False,
+            "note": f"会话目录不存在：{sessions_root}",
+            "results": [],
+        }
+
+    node = _resolve_node()
+    if node is None:
+        raise ToolFailure("node_missing", "找不到 node（会话解压依赖 Node 22+ 的 zstd 支持），请修复 PATH")
+
+    cutoff = time.time() - days * 86400 if days else None
+    try:
+        files = sorted(
+            sessions_root.glob("*/*/session.v4.jsonl.zstd"),
+            key=lambda item: item.stat().st_mtime if item.exists() else 0,
+            reverse=True,
+        )
+    except OSError as exc:
+        raise ToolFailure("sessions_unreadable", f"无法列出会话目录：{exc}")
+
+    hits: list[dict[str, Any]] = []
+    scanned = 0
+    matched_sessions = 0
+    cache_hits = 0
+    skipped: list[str] = []
+
+    for session_file in files:
+        if scanned >= MAX_SESSION_SCAN or len(hits) >= SESSION_MAX_HITS:
+            break
+        key = str(session_file.relative_to(sessions_root)).replace("\\", "/")
+        if session_filter and session_filter.lower() not in key.lower():
+            continue
+        try:
+            mtime = session_file.stat().st_mtime
+        except OSError:
+            continue
+        if cutoff is not None and mtime < cutoff:
+            continue
+        scanned += 1
+        try:
+            events, partial, from_cache = _load_session(root, session_file, node)
+        except ToolFailure as exc:
+            skipped.append(f"{key}: {exc.message}")
+            continue
+        if from_cache:
+            cache_hits += 1
+        if partial:
+            skipped.append(f"{key}: 有解压失败的帧，结果可能不完整")
+        session_id = session_file.parent.name
+        before = len(hits)
+        for event in events:
+            if role != "any" and event["role"] != role:
+                continue
+            haystack = event["text"].lower()
+            if not all(token in haystack for token in tokens):
+                continue
+            score = 3.0 if phrase in haystack else 1.0 + 0.5 * len(tokens)
+            hits.append(
+                {
+                    "session": key,
+                    "session_id": session_id,
+                    "seq": event["seq"],
+                    "time": event["time"],
+                    "role": event["role"],
+                    "score": round(score, 2),
+                    "snippet": _make_snippet(event["text"], tokens),
+                }
+            )
+            if len(hits) >= SESSION_MAX_HITS:
+                break
+        if len(hits) > before:
+            matched_sessions += 1
+
+    # 时间倒序：同会话内 seq 大的在前；无时间的排后面。
+    hits.sort(key=lambda item: (item["time"], item["seq"]), reverse=True)
+    truncated = len(hits) > limit
+    return {
+        "ok": True,
+        "query": query,
+        "tokens": tokens,
+        "count": len(hits[:limit]),
+        "total_hits": len(hits),
+        "truncated": truncated,
+        "scanned_sessions": scanned,
+        "matched_sessions": matched_sessions,
+        "cache_hits": cache_hits,
+        "note": "；".join(skipped[:5]),
+        "results": hits[:limit],
+    }
+
+
+# ---------------------------------------------------------------------------
 # MCP 工具定义：必须按名称字母序返回，schema 全程不变
 # ---------------------------------------------------------------------------
 
@@ -1037,6 +1367,35 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "session_search",
+        "description": "检索历史会话原文（.dsh/sessions 下的多帧 zstd 会话文件）：按关键词搜用户与助手的真实发言，返回会话名、seq、时间与上下文片段。只读。用于回答“以前聊过什么 / 我说过什么 / 那句话在哪场会话”这类记忆层与归档都不沉淀的问题。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "关键词，空格分隔表示必须同时命中。"},
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "description": "最多返回多少条命中，默认 20。",
+                },
+                "session": {"type": "string", "description": "只搜会话名里包含该片段的会话（可选）。"},
+                "role": {
+                    "type": "string",
+                    "enum": ["any", "user", "assistant"],
+                    "description": "只看谁说的话，默认 any。",
+                },
+                "days": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "只搜最近 N 天修改过的会话文件；0 表示全部，默认 0。",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
 ]
 # 缓存友好铁律：注册顺序按工具名字母序固定，保证 tools 数组字节级稳定。
 TOOL_DEFINITIONS.sort(key=lambda item: item["name"])
@@ -1048,6 +1407,7 @@ TOOL_HANDLERS = {
     "get_memory_index": get_memory_index,
     "read_emotion_state": read_emotion_state,
     "read_memory_entry": read_memory_entry,
+    "session_search": session_search,
 }
 
 
@@ -1195,6 +1555,11 @@ def main(argv: list[str] | None = None) -> int:
         help="记忆系统根目录",
     )
     parser.add_argument("--verbose", action="store_true", help="输出调试日志")
+    parser.add_argument("--search", default="", help="不启动 MCP，直接检索历史会话原文后退出（命令行用）")
+    parser.add_argument("--limit", type=int, default=DEFAULT_SESSION_RESULTS, help="--search 时最多返回多少条命中")
+    parser.add_argument("--session", default="", help="--search 时只搜名字包含该片段的会话")
+    parser.add_argument("--role", default="any", choices=("any", "user", "assistant"), help="--search 时只看谁说的话")
+    parser.add_argument("--days", type=int, default=0, help="--search 时只搜最近 N 天改过的会话；0 表示全部")
     args = parser.parse_args(argv)
 
     root = Path(args.root).expanduser()
@@ -1205,6 +1570,24 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         print(f"memory_system: 无法初始化根目录 {root}: {exc}", file=sys.stderr)
         return 2
+
+    if args.search:
+        try:
+            payload = session_search(
+                root,
+                {
+                    "query": args.search,
+                    "limit": args.limit,
+                    "session": args.session,
+                    "role": args.role,
+                    "days": args.days,
+                },
+            )
+        except ToolFailure as exc:
+            print(json.dumps({"ok": False, "error": {"code": exc.code, "message": exc.message}}, ensure_ascii=False, indent=2))
+            return 1
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
 
     LOGGER.info("MCP 服务端启动，根目录=%s，Python=%s", root, sys.version.split()[0])
     try:

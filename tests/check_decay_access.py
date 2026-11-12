@@ -23,6 +23,7 @@ EXPECTED_TOOLS = [
     "get_memory_index",
     "read_emotion_state",
     "read_memory_entry",
+    "session_search",
 ]
 
 
